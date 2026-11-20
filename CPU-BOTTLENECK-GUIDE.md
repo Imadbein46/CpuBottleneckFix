@@ -77,6 +77,30 @@ Let the game finish "compiling shaders" at start-up if it has that option, do no
 cache, keep the game on an SSD, keep some free RAM, and exclude the folders from the antivirus. Shader-compile
 stutter often disappears after the first pass through an area. `HITCH:` lines show which threads were busy.
 
+## Frame generation and the overlay
+
+With DLSS Frame Generation (thread names such as `nv.sl.dlss_g.thread.dlssg`) or FSR 3, the FPS the overlay shows
+is what reaches the screen, including generated frames. The game's own update rate is lower (half, with 2x). Frame
+generation improves smoothness, it does not remove a CPU limit: if the busiest thread is still at 95-100 %, the
+game logic is still CPU-bound.
+
+## Windows 11 settings worth checking
+
+* *Settings -> Privacy & security -> Windows Security -> Device security -> Core isolation -> Memory integrity*.
+  On some systems it costs a few percent of CPU performance in games. Turning it off lowers a security feature,
+  so decide for yourself. With `Log=1` the log's `system:` lines tell you whether it is on.
+* *Settings -> System -> Power -> Power mode = Best performance* (and the High performance plan on desktops).
+* *Settings -> Gaming -> Game Mode = On*.
+
+## Case studies (two logs, Windows 11)
+
+| Game | Limiting thread | Evidence | Reading |
+|---|---|---|---|
+| Assassin's Creed IV (32-bit, D3D11) | `[AC4BFSP.exe] render`, 93-100 %, 3 % kernel | whole process only ~35 % CPU | game's own draw-call submission on one thread; settings, driver or DXVK experiments |
+| Cyberpunk 2077 (64-bit, D3D12) | `"GameThread" [Cyberpunk2077.exe]`, 91-100 %, 2 % kernel | 97 % of samples CPU-bound; process CPU 18 % for minutes at a time | game logic on the main thread; settings, mods, CPU speed |
+
+In both games the CPU fix toggle made no clear difference, as expected for a thread limited by its own work.
+
 ## How to compare fairly
 
 Use the overlay in the same slow scene, one change at a time, and note FPS and the *Limit:* line. If *Limit*
