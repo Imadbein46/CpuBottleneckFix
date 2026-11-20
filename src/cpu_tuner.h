@@ -41,7 +41,8 @@ public:
     void SetEnabled(bool on);             // apply / restore. Worker thread only.
     bool Enabled() const { return enabled_.load(std::memory_order_relaxed); }
 
-    // Call regularly from ONE thread. Cheap: it only does real work every cfg.sampleMs.
+    // Call regularly from ONE thread. Cheap: with wantMetrics it measures every thread each cfg.sampleMs; without it
+    // (overlay hidden, log off) it only keeps the two critical threads tuned and does a full scan once a minute.
     // renderThreadId = thread that calls Present (0 if unknown), selfThreadId = the calling thread (never tuned).
     void Tick(DWORD renderThreadId, DWORD selfThreadId, bool wantMetrics);
 
@@ -82,6 +83,7 @@ private:
     void ApplyProcessSettings();
     void RestoreProcessSettings();
     void Sample(uint64_t nowQpc, DWORD renderTid, DWORD selfTid);
+    void TuneCriticalOnly(DWORD renderTid, DWORD selfTid);
     void TuneThread(DWORD tid, ThreadState& s, bool critical);
     std::string BuildLabel(DWORD tid, const ThreadState& s) const;
     void RestoreThread(ThreadState& s);
@@ -123,6 +125,7 @@ private:
     std::unordered_map<DWORD, ThreadState> threads_;
     uint64_t lastAttemptQpc_ = 0;  // last time a sample was tried
     uint64_t lastSampleQpc_ = 0;   // last time a sample succeeded (basis for load deltas)
+    uint64_t lastFullQpc_ = 0;     // last full scan of all threads
     uint64_t lastProcCpu100ns_ = 0;
     uint64_t qpcFreq_ = 1;
     int samples_ = 0;
