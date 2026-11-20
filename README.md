@@ -1,4 +1,4 @@
-# CpuBottleneckFix.asi
+# CpuBottleneckFix
 
 An ASI plugin for [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) that
 
@@ -59,15 +59,22 @@ bound by its own single-threaded logic the gain is small. Gains are largest on s
 power-saving settings or hybrid cores, and sometimes there is no visible change. Use the hotkey and the overlay
 to compare ON and OFF on your system.
 
-## Version 1.1 (changes made after the first real-world log)
+## What changed in 1.1 and 1.2 (driven by real-world logs)
 
-* The CPU fix now tunes only the presenting thread and the main thread (v1.0 also boosted up to 7 busy
-  background threads, which a real log showed was pointless and could be counter-productive). `HotThreads`
-  was replaced by `TuneWorkerThreads` (default 0).
-* The log now says **which thread is the bottleneck**: a `LIMIT:` line (a thread at 90%+ for 3 s) and a
-  `HITCH:` line (a frame over 100 ms) list the busiest threads with their name, the module they started in
-  and their kernel-mode share. The overlay shows the same for the busiest thread.
-* The 5-second stats line no longer repeats stale numbers while the game is paused or minimised.
+* **1.2** The "render thread" is only tuned if the same thread has been presenting frames for 5 s. Engines with a
+  job system (e.g. Cyberpunk 2077) and frame generation present from a different thread every frame; v1.1 kept
+  re-tuning a random worker thread there.
+* **1.2** When the overlay is hidden and `Log=0` the plugin no longer measures every thread: it keeps the two
+  critical threads tuned and rescans once a minute. (v1.1 measured everything once a second, about 3 % of one
+  core, mostly kernel time spent walking the system thread list.) With the overlay or log on, sampling is now
+  every 2 s by default.
+* **1.2** With `Log=1` the log starts with a system summary: CPU model, RAM, Windows build, power plan, Game
+  Mode, memory integrity (HVCI) and virtualization-based security. It stays in the local log file.
+* **1.2** The overlay notes when a frame-generation module (DLSS-G, FSR 3) is loaded, because the shown FPS
+  then includes generated frames.
+* **1.1** Only the presenting thread and the main thread are tuned (`HotThreads` became `TuneWorkerThreads`,
+  default 0). `LIMIT:` and `HITCH:` log lines name the busiest threads with their name, module and kernel share.
+  The 5-second stats line no longer repeats stale numbers while the game is paused.
 
 See `CPU-BOTTLENECK-GUIDE.md` for how to read these lines and what to do about them.
 
@@ -78,6 +85,8 @@ See `CPU-BOTTLENECK-GUIDE.md` for how to read these lines and what to do about t
 * The overlay is a separate click-through window on top of the game. It appears in windowed, borderless and
   most modern fullscreen modes, but **not over true exclusive fullscreen** (some older D3D9 / D3D8 / OpenGL games).
   The FPS numbers are still collected and appear in `CpuBottleneckFix.log` if you set `Log=1`.
+* **Frame generation** (DLSS-G / FSR 3 / Lossless Scaling style) makes the overlay show *displayed* frames, which
+  can be 2-4x the rate at which the game itself runs. The *Limit* hint is unreliable while it is active.
 * DirectDraw and software-rendered games are not supported (no frame counter). The CPU fix still works for them.
 * Games that already pin their own threads or set their own timer/priority may leave less for the fix to do.
 * The plugin creates a throwaway D3D device once at start-up to find the present functions (the same technique as
