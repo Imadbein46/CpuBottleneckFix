@@ -56,6 +56,8 @@ static_assert(offsetof(PROCESSOR_RELATIONSHIP, GroupCount) == 22, "unexpected PR
 constexpr double kWorkerEnterLoad = 0.60;  // an extra worker thread must use >= 60% of a core to be picked...
 constexpr double kWorkerStayLoad = 0.30;   // ...and keeps its place while it stays above 30%
 constexpr int kMissedSamplesBeforeRestore = 3;
+constexpr uint64_t kIdleTickMs = 5000;        // how often the critical threads are re-checked when nothing is displayed
+constexpr uint64_t kIdleFullScanMs = 60000;   // and how often all threads are scanned (also frees handles of dead threads)
 
 }  // namespace
 
@@ -150,6 +152,24 @@ void CpuTuner::BuildTopology() {
             }
         }
         off += r->Size;
+    }
+
+    {
+        unsigned smt = 0, classes = 0;
+        BYTE seen[256] = {};
+        for (const Core& co : cores_) {
+            if (!seen[co.efficiencyClass]) {
+                seen[co.efficiencyClass] = 1;
+                ++classes;
+            }
+        }
+        for (DWORD off = 0; off + 8 <= len;) {
+            auto* r = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
+            if (r->Size == 0) break;
+            if (r->Relationship == RelationProcessorCore && (r->Processor.Flags & 1 /* LTP_PC_SMT */)) ++smt;
+            off += r->Size;
+        }
+        log::Write("topology: %u physical cores (%u with SMT), %u efficiency class(es)", static_cast<unsigned>(cores_.size()), smt, classes);
     }
 
     // Core 0 usually takes most interrupts and DPCs. Keep hot threads off it when there are enough other cores.
@@ -397,11 +417,58 @@ void CpuTuner::RestoreAllThreads() {
 
 void CpuTuner::Tick(DWORD renderTid, DWORD selfTid, bool wantMetrics) {
     if (!initialised_) return;
-    if (!wantMetrics && !enabled_.load(std::memory_order_relaxed)) return;
+    const bool enabled = enabled_.load(std::memory_order_relaxed);
+    if (!wantMetrics && !enabled) return;
     const uint64_t now = Qpc();
-    if (lastAttemptQpc_ != 0 && (now - lastAttemptQpc_) * 1000 / qpcFreq_ < static_cast<uint64_t>(cfg_.sampleMs)) return;
+    const uint64_t sinceMs = lastAttemptQpc_ ? (now - lastAttemptQpc_) * 1000 / qpcFreq_ : ~0ull;
+
+    if (wantMetrics) {  // overlay visible or logging: measure every thread
+        if (sinceMs < static_cast<uint64_t>(cfg_.sampleMs)) return;
+        lastAttemptQpc_ = now;
+        Sample(now, renderTid, selfTid);
+        return;
+    }
+
+    // Nobody looks at the numbers: keep the two critical threads tuned, and rescan everything only once a minute
+    // (the scan is the expensive part: it walks every thread in the system).
+    if (sinceMs < kIdleTickMs) return;
     lastAttemptQpc_ = now;
-    Sample(now, renderTid, selfTid);
+    const bool fullDue = mainTid_ == 0 || !threads_.count(mainTid_) || (now - lastFullQpc_) * 1000 / qpcFreq_ > kIdleFullScanMs;
+    if (fullDue) {
+        Sample(now, renderTid, selfTid);
+    } else {
+        TuneCriticalOnly(renderTid, selfTid);
+    }
+}
+
+void CpuTuner::TuneCriticalOnly(DWORD renderTid, DWORD selfTid) {
+    if (!cfg_.threadTuning) return;
+    auto ensure = [&](DWORD tid) {
+        if (tid == 0 || tid == selfTid) return;
+        auto it = threads_.find(tid);
+        if (it == threads_.end()) {
+            HANDLE h = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, FALSE, tid);
+            if (!h) return;
+            ThreadState fresh;
+            fresh.handle = h;
+            it = threads_.emplace(tid, fresh).first;
+        }
+        ThreadState& st = it->second;
+        st.missed = 0;
+        if (st.tuned && st.critical) return;
+        if (st.tuned) RestoreThread(st);
+        TuneThread(tid, st, true);
+    };
+    ensure(renderTid);
+    ensure(mainTid_);
+    for (auto& kv : threads_) {
+        ThreadState& st = kv.second;
+        if (!st.tuned || kv.first == renderTid || kv.first == mainTid_) continue;
+        if (++st.missed >= kMissedSamplesBeforeRestore) RestoreThread(st);
+    }
+    int tuned = 0;
+    for (const auto& kv : threads_) tuned += kv.second.tuned ? 1 : 0;
+    metrics_.tunedThreads = tuned;
 }
 
 void CpuTuner::Sample(uint64_t now, DWORD renderTid, DWORD selfTid) {
@@ -508,6 +575,7 @@ void CpuTuner::Sample(uint64_t now, DWORD renderTid, DWORD selfTid) {
     }
     lastProcCpu100ns_ = procCpu;
     lastSampleQpc_ = now;
+    lastFullQpc_ = now;
     ++samples_;
     metrics_.sampleSeq = static_cast<uint32_t>(samples_);
 
