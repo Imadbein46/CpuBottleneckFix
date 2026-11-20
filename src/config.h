@@ -36,7 +36,7 @@ struct CpuFixConfig {
     bool preferPerformanceCores = true;
     bool avoidCpu0 = true;
     bool useMmcss = true;
-    int sampleMs = 1000;          // 250..10000
+    int sampleMs = 2000;          // 250..10000
 };
 
 struct Config {
