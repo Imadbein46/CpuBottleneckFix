@@ -22,6 +22,7 @@
 #include "log.h"
 #include "overlay.h"
 #include "sources.h"
+#include "sysinfo.h"
 
 #ifndef CBF_VERSION
 #define CBF_VERSION "1.0.0"
@@ -38,6 +39,7 @@ Overlay g_overlay;
 
 std::atomic<DWORD> g_renderTid{0};
 std::atomic<const char*> g_api{nullptr};
+std::atomic<bool> g_frameGenLoaded{false};  // a frame-generation module is loaded: shown FPS may include generated frames
 volatile LONG g_initState = 0;
 uint64_t g_qpcFreq = 1;
 
@@ -123,6 +125,7 @@ std::vector<OverlayLine> BuildLines(bool statsOn, const std::wstring& toast) {
                 }
             }
             if (const char* api = g_api.load(std::memory_order_relaxed)) lines.push_back({Fmt(L"API: %ls", Widen(api).c_str()), kGrey});
+            if (g_frameGenLoaded.load(std::memory_order_relaxed)) lines.push_back({L"Frame generation loaded: FPS may include generated frames", kGrey});
         }
         if (o.cpuFixState) {
             const bool on = g_tuner.Enabled();
@@ -194,6 +197,8 @@ DWORD WINAPI WorkerMain(LPVOID) {
     uint64_t toastUntil = 0, nextPoll = 0, nextRefresh = 0, nextWindowSearch = 0, nextStatsLog = 5000, nextLimitLog = 0, nextHitchLog = 0, nextDiag = 0;
     uint32_t lastSeq = 0;
     int sustainedLimit = 0;
+    DWORD seenRender = 0, stableRender = 0;
+    uint64_t renderSince = 0, nextFgCheck = 0;
     HWND game = nullptr;
 
     for (;;) {
@@ -223,7 +228,23 @@ DWORD WINAPI WorkerMain(LPVOID) {
             nextPoll = now + 250;
         }
 
-        g_tuner.Tick(g_renderTid.load(std::memory_order_relaxed), GetCurrentThreadId(), overlayOn || g_cfg.log);
+        // Some engines (job systems such as Cyberpunk's redDispatcher, or frame generation) present from a different
+        // thread every frame. Only a presenter that stayed the same for 5 s counts as "the render thread".
+        const DWORD curRender = g_renderTid.load(std::memory_order_relaxed);
+        if (curRender != seenRender) {
+            seenRender = curRender;
+            renderSince = now;
+            stableRender = 0;
+        } else if (curRender != 0 && now - renderSince >= 5000) {
+            stableRender = curRender;
+        }
+        if (now >= nextFgCheck) {
+            nextFgCheck = now + 2000;
+            g_frameGenLoaded.store(GetModuleHandleW(L"nvngx_dlssg.dll") || GetModuleHandleW(L"sl.dlss_g.dll") || GetModuleHandleW(L"amd_fidelityfx_framegeneration_dx12.dll"),
+                                   std::memory_order_relaxed);
+        }
+
+        g_tuner.Tick(stableRender, GetCurrentThreadId(), overlayOn || g_cfg.log);
 
         if (g_cfg.log && now >= nextDiag) {  // diagnostics, written to the log file only, checked 4x per second
             nextDiag = now + 250;
@@ -290,6 +311,7 @@ void Init() {
     if (!g_cfg.enabled) return;
     log::Init((base + L".log").c_str(), g_cfg.log);
     log::Write("CpuBottleneckFix " CBF_VERSION " (%s) starting", sizeof(void*) == 8 ? "x64" : "x86");
+    if (g_cfg.log) LogSystemInfo();
 
     LARGE_INTEGER f;
     g_qpcFreq = (QueryPerformanceFrequency(&f) && f.QuadPart > 0) ? static_cast<uint64_t>(f.QuadPart) : 1;
