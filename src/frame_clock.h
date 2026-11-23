@@ -21,6 +21,17 @@ struct FrameStats {
     double msSinceLastFrame = 0;   // how long ago the last Present started
 };
 
+// Raw event counters, to find out WHY no frames are being measured (e.g. Present is called but every call is
+// ignored, or the clock is not moving forward).
+struct FrameCounters {
+    uint64_t begins = 0;            // Present calls offered to the clock
+    uint64_t ignoredSecondary = 0;  // calls ignored because another surface is the measured one
+    uint64_t primarySwitches = 0;   // times the measured surface changed
+    uint64_t longGaps = 0;          // gaps over 5 s between two calls of the measured surface
+    uint64_t clockNotForward = 0;   // calls whose timestamp was not later than the previous one
+    uint64_t entries = 0;           // frames recorded
+};
+
 class FrameClock {
 public:
     struct Ticket {
@@ -40,6 +51,7 @@ public:
     void End(const Ticket& ticket, uint64_t nowTicks);
 
     FrameStats Snapshot(uint64_t nowTicks) const;
+    FrameCounters Counters() const;
 
     static constexpr uint32_t kRing = 8192;  // power of two
 
@@ -48,6 +60,7 @@ private:
     std::atomic<uintptr_t> primary_{0};
     std::atomic<uint64_t> lastBegin_{0};
     std::atomic<uint64_t> head_{0};
+    std::atomic<uint64_t> begins_{0}, ignored_{0}, switches_{0}, longGaps_{0}, notForward_{0};
     std::atomic<uint32_t> intervalUs_[kRing];
     std::atomic<uint32_t> presentUs_[kRing];
 };
