@@ -22,6 +22,7 @@ struct OverlayConfig {
     bool busiestThread = true;
     bool bottleneck = true;
     bool cpuFixState = true;
+    bool syncInfo = true;
 };
 
 struct CpuFixConfig {
@@ -37,6 +38,13 @@ struct CpuFixConfig {
     bool avoidCpu0 = true;
     bool useMmcss = true;
     int sampleMs = 2000;          // 250..10000
+    bool useAllCpus = true;           // let the process use every logical CPU (undo a restricted process affinity)
+    bool widenThreadAffinity = false; // also widen threads the game pinned to fewer CPUs than the process may use
+};
+
+struct SyncConfig {
+    bool enabledAtStart = false;   // frame-latency control is opt-in
+    int maxFrameLatency = 1;       // frames the CPU may queue ahead of the GPU while it is on (1..8)
 };
 
 struct Config {
@@ -44,6 +52,8 @@ struct Config {
     bool log = false;
     Hotkey keyOverlay;
     Hotkey keyCpuFix;
+    Hotkey keySync;
+    SyncConfig sync;
     OverlayConfig overlay;
     CpuFixConfig cpu;
 };
