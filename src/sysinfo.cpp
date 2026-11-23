@@ -4,9 +4,13 @@
 
 #include <cpuid.h>
 
+#include <algorithm>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "log.h"
+#include "power_guids.h"
 
 namespace cbf {
 namespace {
@@ -70,6 +74,9 @@ void LogSystemInfo() {
     const long vbs = ReadDword(regGet, HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", L"EnableVirtualizationBasedSecurity");
     const long gameMode = ReadDword(regGet, HKEY_CURRENT_USER, L"Software\\Microsoft\\GameBar", L"AutoGameModeEnabled");
     log::Write("system: memory integrity (HVCI) %s, virtualization-based security %s, Game Mode %s", OnOff(hvci), OnOff(vbs), OnOff(gameMode));
+    // Hardware-accelerated GPU scheduling: the GPU schedules its own work instead of the CPU doing it (2 = on, 1 = off)
+    const long hags = ReadDword(regGet, HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", L"HwSchMode");
+    log::Write("system: hardware GPU scheduling (HAGS) %s", hags == 2 ? "ON" : (hags == 1 ? "off" : "unknown/not set"));
 
     // active power plan
     HMODULE pp = LoadLibraryW(L"powrprof.dll");
@@ -86,8 +93,48 @@ void LogSystemInfo() {
         else if (IsEqualGUID(*scheme, kSaver)) name = "Power saver";
         else if (IsEqualGUID(*scheme, kUltimate)) name = "Ultimate performance";
         log::Write("system: power plan %s", name);
+
+        // The plan's CPU limits (plugged-in values). Below 100 % means the plan holds the CPU back.
+        static_assert(sizeof(GuidBytes) == sizeof(GUID), "GuidBytes must have the layout of GUID");
+        auto readAc = Resolve<DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, PDWORD)>(pp, "PowerReadACValueIndex");
+        auto value = [&](const GuidBytes& setting) -> long {
+            DWORD v = 0;
+            if (!readAc || readAc(nullptr, scheme, reinterpret_cast<const GUID*>(&kGuidProcessorSubgroup), reinterpret_cast<const GUID*>(&setting), &v) != ERROR_SUCCESS) return -1;
+            return static_cast<long>(v);
+        };
+        const long minState = value(kGuidMinProcessorState), maxState = value(kGuidMaxProcessorState), parkMin = value(kGuidCoreParkingMinCores), boost = value(kGuidPerfBoostMode);
+        auto num = [](long v) { return v < 0 ? std::string("n/a") : std::to_string(v); };
+        log::Write("system: power plan CPU limits (plugged in): min processor state %s%%, max processor state %s%%, core parking keeps at least %s%% of cores awake, boost mode %s (0 disabled, 1 enabled, 2 aggressive)",
+                   num(minState).c_str(), num(maxState).c_str(), num(parkMin).c_str(), num(boost).c_str());
+        if (maxState >= 0 && maxState < 100) log::Write("system: WARNING the power plan caps the CPU at %ld%% of its speed", maxState);
+        if (parkMin >= 0 && parkMin < 100) log::Write("system: note: core parking may put up to %ld%% of the cores to sleep when they look idle", 100 - parkMin);
+        if (boost == 0) log::Write("system: WARNING processor boost is disabled in the power plan");
         LocalFree(scheme);
     }
+}
+
+void LogLoadedModules() {
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    auto enumModules = Resolve<BOOL(WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD)>(k32, "K32EnumProcessModules");
+    auto baseName = Resolve<DWORD(WINAPI*)(HANDLE, HMODULE, LPWSTR, DWORD)>(k32, "K32GetModuleBaseNameW");
+    if (!enumModules || !baseName) return;
+    std::vector<HMODULE> mods(1024);
+    DWORD needed = 0;
+    if (!enumModules(GetCurrentProcess(), mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &needed)) return;
+    const size_t count = std::min<size_t>(needed / sizeof(HMODULE), mods.size());
+    std::string line = "modules:";
+    for (size_t i = 0; i < count; ++i) {
+        wchar_t name[128];
+        if (!baseName(GetCurrentProcess(), mods[i], name, 128)) continue;
+        std::string n;
+        for (const wchar_t* p = name; *p && n.size() < 60; ++p) n.push_back((*p >= 32 && *p < 127) ? static_cast<char>(*p) : '?');
+        if (line.size() + n.size() + 2 > 460) {
+            log::Write("%s", line.c_str());
+            line = "modules (cont.):";
+        }
+        line += " " + n;
+    }
+    log::Write("%s", line.c_str());
 }
 
 }  // namespace cbf
