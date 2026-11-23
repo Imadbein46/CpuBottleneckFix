@@ -4,4 +4,6 @@
 
 namespace cbf {
 void LogSystemInfo();
+// Names of the DLLs loaded in the process (to spot overlays, wrappers, second copies of graphics DLLs).
+void LogLoadedModules();
 }
