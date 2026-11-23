@@ -31,6 +31,10 @@ public:
         DWORD hottestTid = 0;
         std::string hottestLabel;      // e.g. "RenderThread" [game.exe] render
         int tunedThreads = 0;
+        int allowedCpus = 0;           // logical CPUs the process may run on
+        int systemCpus = 0;            // logical CPUs the system has (in the process's group)
+        int restrictedThreads = 0;     // threads pinned to fewer CPUs than the process may use
+        int widenedThreads = 0;        // of those, threads we widened
         uint32_t sampleSeq = 0;        // increments with every completed sample
     };
 
@@ -69,7 +73,11 @@ private:
         std::string label;
         bool haveLabel = false;
         uint32_t labelSeq = 0;
+        DWORD_PTR affinityMask = 0;       // last seen affinity mask of the thread
+        bool affinityWidened = false;
+        DWORD_PTR origAffinity = 0, ourAffinity = 0;
         bool tuned = false;
+        bool ignore = false;     // looked at and deliberately left alone (e.g. a frame-generation pacer thread)
         bool critical = false;
         int slot = -1;
         int missed = 0;
@@ -87,6 +95,8 @@ private:
     void TuneThread(DWORD tid, ThreadState& s, bool critical);
     std::string BuildLabel(DWORD tid, const ThreadState& s) const;
     void RestoreThread(ThreadState& s);
+    void RestoreAffinity(ThreadState& s);
+    void RefreshAffinityState();
     void RestoreAllThreads();
     int AllocSlot();
     void FreeSlot(int slot);
@@ -106,12 +116,22 @@ private:
         BOOL(WINAPI* GetProcessGroupAffinity)(HANDLE, PUSHORT, PUSHORT) = nullptr;
         LONG(NTAPI* NtQueryInformationThread)(HANDLE, ULONG, PVOID, ULONG, PULONG) = nullptr;
         HRESULT(WINAPI* GetThreadDescription)(HANDLE, PWSTR*) = nullptr;
+        BOOL(WINAPI* GetProcessInformation)(HANDLE, int, LPVOID, DWORD) = nullptr;
+        BOOL(WINAPI* GetThreadGroupAffinity)(HANDLE, PGROUP_AFFINITY) = nullptr;
     } api_;
 
     // process-level state
     bool timerRequested_ = false;
     ULONG timerRequestedUnits_ = 0;
     bool throttlingChanged_ = false;
+    bool affinityChanged_ = false;            // we widened the process affinity
+    DWORD_PTR origProcessAffinity_ = 0, ourProcessAffinity_ = 0;
+    bool singleGroup_ = true;                 // the process lives in one processor group (affinity work only then)
+    WORD procGroup_ = 0;
+    int lastRestrictedLogged_ = -1;
+    uint64_t nextRestrictedLogQpc_ = 0;
+    bool haveOrigThrottle_ = false;           // the state before we changed it could be read
+    ULONG origThrottleControl_ = 0, origThrottleState_ = 0;
     bool priorityChanged_ = false;
     DWORD origPriorityClass_ = 0, ourPriorityClass_ = 0;
 
