@@ -2,12 +2,15 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "../src/bottleneck.h"
 #include "../src/frame_clock.h"
 #include "../src/hotkey.h"
+#include "../src/power_guids.h"
+#include "../src/tuner_policy.h"
 
 static int g_failed = 0, g_checks = 0;
 #define CHECK(cond)                                                              \
@@ -205,6 +208,100 @@ static void TestFrameClockConcurrent() {
     CHECK(bad == 0);
 }
 
+static void TestFrameClockCounters() {
+    FrameClock c(TPS);
+    uint64_t t = Ms(1000);
+    t = Feed(c, t, 10, 10.0, 1.0);                       // 10 frames on surface 1
+    auto sec = c.Begin(2, t);                            // a secondary surface
+    c.End(sec, t + Ms(1));
+    t += Ms(30000);                                      // 30 s pause
+    t = Feed(c, t, 3, 10.0, 1.0);                        // surface 1 again after a long gap
+    FrameCounters k = c.Counters();
+    CHECK(k.begins == 14);
+    CHECK(k.ignoredSecondary == 1);
+    CHECK(k.primarySwitches == 1);
+    CHECK(k.longGaps == 1);
+    CHECK(k.clockNotForward == 0);
+    CHECK(k.entries == 9 + 2);                           // first frame and the one after the pause have no interval
+
+    // a clock that does not move forward never produces a frame, and the counter says so
+    FrameClock d(TPS);
+    for (int i = 0; i < 20; ++i) {
+        auto tk = d.Begin(7, Ms(5000));                  // same timestamp every time
+        d.End(tk, Ms(5000));
+    }
+    CHECK(d.Snapshot(Ms(5000)).totalFrames == 0);
+    CHECK(d.Counters().clockNotForward == 19);
+}
+
+static std::vector<uint32_t> Ids(const std::vector<Target>& t) {
+    std::vector<uint32_t> v;
+    for (const Target& x : t) v.push_back(x.tid);
+    return v;
+}
+
+static void TestTunerPolicy() {
+    const std::vector<ThreadView> th = {{10, 0.05, false}, {11, 0.95, false}, {12, 0.70, false}, {13, 0.65, false}, {14, 0.35, false}, {15, 0.35, true}, {99, 0.99, false}};
+    // critical threads only (workers off): render first, then main
+    auto t = ChooseTargets(th, 11, 10, 99, 0);
+    CHECK(t.size() == 2 && t[0].tid == 11 && t[0].critical && t[1].tid == 10 && t[1].critical);
+    // render == main collapses to one target
+    t = ChooseTargets(th, 10, 10, 99, 0);
+    CHECK(t.size() == 1 && t[0].tid == 10);
+    // unknown render thread (0) and a thread id that does not exist are ignored
+    t = ChooseTargets(th, 0, 10, 99, 0);
+    CHECK(Ids(t) == std::vector<uint32_t>{10});
+    t = ChooseTargets(th, 777, 10, 99, 0);
+    CHECK(Ids(t) == std::vector<uint32_t>{10});
+    // the calling thread is never chosen, even if it is the busiest or named as render/main
+    t = ChooseTargets(th, 99, 99, 99, 3);
+    for (const Target& x : t) CHECK(x.tid != 99);
+    // workers: busiest first, hysteresis (14 at 35% does not enter, 15 at 35% already tuned stays), cap respected
+    t = ChooseTargets(th, 10, 10, 99, 6);
+    CHECK((Ids(t) == std::vector<uint32_t>{10, 11, 12, 13, 15}));
+    for (size_t i = 1; i < t.size(); ++i) CHECK(!t[i].critical);
+    t = ChooseTargets(th, 10, 10, 99, 2);
+    CHECK((Ids(t) == std::vector<uint32_t>{10, 11, 12}));   // main + 2 workers
+    // a critical thread is not repeated as a worker
+    t = ChooseTargets(th, 11, 10, 99, 6);
+    CHECK((Ids(t) == std::vector<uint32_t>{11, 10, 12, 13, 15}));
+    // equal loads: ordered by thread id, so the result is deterministic
+    const std::vector<ThreadView> eq = {{30, 0.8, false}, {20, 0.8, false}, {25, 0.8, false}};
+    t = ChooseTargets(eq, 0, 0, 1, 2);
+    CHECK((Ids(t) == std::vector<uint32_t>{20, 25}));
+    // nothing known: nothing chosen
+    CHECK(ChooseTargets({}, 5, 6, 7, 3).empty());
+}
+
+static void TestAffinityPolicy() {
+    CHECK(ShouldWidenAffinity(0x01, 0xFF));          // pinned to one CPU of eight
+    CHECK(ShouldWidenAffinity(0x0F, 0xFF));          // half the CPUs
+    CHECK(ShouldWidenAffinity(0xFE, 0xFF));          // all but CPU 0
+    CHECK(!ShouldWidenAffinity(0xFF, 0xFF));         // already everything
+    CHECK(!ShouldWidenAffinity(0, 0xFF));            // empty mask: not ours to touch
+    CHECK(!ShouldWidenAffinity(0x01, 0));            // nothing to widen to
+    CHECK(!ShouldWidenAffinity(0x1FF, 0xFF));        // has a CPU outside the target
+    CHECK(!ShouldWidenAffinity(0x100, 0xFF));        // entirely outside the target
+    CHECK(ShouldWidenAffinity(0x8000000000000000ull, 0xFFFFFFFFFFFFFFFFull));  // 64-bit masks
+    CHECK(CountCpus(0) == 0 && CountCpus(0xFF) == 8 && CountCpus(0xFE) == 7 && CountCpus(0xFFFFFFFFFFFFFFFFull) == 64);
+}
+
+static std::string GuidText(const GuidBytes& g) {
+    char b[64];
+    std::snprintf(b, sizeof(b), "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", g.d1, g.d2, g.d3, g.d4[0], g.d4[1], g.d4[2], g.d4[3], g.d4[4], g.d4[5], g.d4[6], g.d4[7]);
+    return b;
+}
+
+static void TestPowerGuids() {
+    static_assert(sizeof(GuidBytes) == 16, "must have the layout of a GUID");
+    // strings as published by Microsoft Learn (powercfg / "Processor power management options")
+    CHECK(GuidText(kGuidProcessorSubgroup) == "54533251-82be-4824-96c1-47b60b740d00");
+    CHECK(GuidText(kGuidMinProcessorState) == "893dee8e-2bef-41e0-89c6-b55d0929964c");
+    CHECK(GuidText(kGuidMaxProcessorState) == "bc5038f7-23e0-4960-96da-33abaf5935ec");
+    CHECK(GuidText(kGuidCoreParkingMinCores) == "0cc5b647-c1df-4637-891a-dec35c318583");
+    CHECK(GuidText(kGuidPerfBoostMode) == "be337238-0d82-4146-a960-4f3749d470c7");
+}
+
 static void TestBottleneck() {
     FrameStats s;
     CHECK(ClassifyBottleneck(s, true, 1.0) == Bound::Unknown);
@@ -226,6 +323,10 @@ int main() {
     TestFrameClockFewFramesAndStall();
     TestFrameClockRingWrap();
     TestFrameClockConcurrent();
+    TestFrameClockCounters();
+    TestTunerPolicy();
+    TestAffinityPolicy();
+    TestPowerGuids();
     TestBottleneck();
     std::printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
