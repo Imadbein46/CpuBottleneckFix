@@ -77,6 +77,51 @@ Let the game finish "compiling shaders" at start-up if it has that option, do no
 cache, keep the game on an SSD, keep some free RAM, and exclude the folders from the antivirus. Shader-compile
 stutter often disappears after the first pass through an area. `HITCH:` lines show which threads were busy.
 
+## Using all CPU cores
+
+A game uses as many threads as its engine creates; no tool can add parallelism to code that is not parallel.
+What *can* hold a game back from your cores is outside the game:
+
+* **Restricted affinity.** Task Manager -> Details -> right-click the game -> *Set affinity*. If CPUs are unticked,
+  something restricted it. The plugin's `UseAllCpus` lifts that while the CPU fix is on (your first recorded game
+  was limited to 7 of 8 CPUs; the others already had all 8).
+* **The power plan.** With `Log=1` the `system:` lines show the plan's limits. A *maximum processor state* below
+  100 % caps the CPU, *core parking* below 100 % lets Windows put cores to sleep, and *boost mode* disabled turns
+  turbo off. To fix a plan (administrator Command Prompt; plugged-in values; the GUIDs are Microsoft's):
+
+  ```
+  powercfg /setacvalueindex SCHEME_CURRENT 54533251-82be-4824-96c1-47b60b740d00 bc5038f7-23e0-4960-96da-33abaf5935ec 100
+  powercfg /setacvalueindex SCHEME_CURRENT 54533251-82be-4824-96c1-47b60b740d00 0cc5b647-c1df-4637-891a-dec35c318583 100
+  powercfg /setactive SCHEME_CURRENT
+  ```
+  The first line sets *maximum processor state* to 100 %, the second keeps all cores awake. The plugin never
+  changes your power plan itself, because that is a persistent system-wide change.
+* **Hyper-threading / SMT.** Your i7-9700K has none (8 cores, 8 threads), so there are no extra threads to unlock.
+* **Thread pools sized at start-up.** Many engines size their worker pools from the CPU count they see when
+  they launch, so a restriction that was lifted later does not grow the pool; start the game with the full
+  affinity if you changed it.
+
+In the recordings the limiting thread was one game thread at about 100 % while the process used 2-5 cores' worth
+of work: the other cores were not forbidden, the game had no more parallel work to give them.
+
+## Syncing the CPU with the GPU
+
+"Sync" can mean three different things, and only one of them is a performance question:
+
+1. **Who waits for whom.** Present wait is the CPU blocked on the GPU or vsync. In your three recordings it was
+   almost zero in 66-94 % of the samples: the GPU was waiting for the CPU. Nothing in the sync settings can fix
+   that; only the single busiest thread getting faster can.
+2. **How far ahead the CPU may run.** The render queue (Direct3D 11: maximum frame latency, default 3). A shorter
+   queue means lower input latency and less run-ahead, and a few percent less FPS in GPU-bound scenes. The plugin
+   can cap it (`[Sync]`, `Ctrl+F11`).
+3. **How the frame reaches the display.** vsync on/off, tearing allowed, flip or blit. With variable refresh
+   rate (G-Sync / FreeSync) the best-known recipe is: vsync on in the driver, the game's own limiter or a cap
+   about 3 fps below the refresh rate, and the low-latency mode of the driver (NVIDIA Reflex / Low Latency) on.
+   That keeps the queue empty without wasting frames.
+
+For a game that is CPU-bound, as all three of your recordings were, items 2 and 3 change feel (latency,
+pacing), not the CPU limit.
+
 ## Frame generation and the overlay
 
 With DLSS Frame Generation (thread names such as `nv.sl.dlss_g.thread.dlssg`) or FSR 3, the FPS the overlay shows
@@ -99,7 +144,19 @@ game logic is still CPU-bound.
 | Assassin's Creed IV (32-bit, D3D11) | `[AC4BFSP.exe] render`, 93-100 %, 3 % kernel | whole process only ~35 % CPU | game's own draw-call submission on one thread; settings, driver or DXVK experiments |
 | Cyberpunk 2077 (64-bit, D3D12) | `"GameThread" [Cyberpunk2077.exe]`, 91-100 %, 2 % kernel | 97 % of samples CPU-bound; process CPU 18 % for minutes at a time | game logic on the main thread; settings, mods, CPU speed |
 
-In both games the CPU fix toggle made no clear difference, as expected for a thread limited by its own work.
+Cyberpunk 2077 again, with system info (Intel Core i7-9700K, 8 cores / 8 threads, 2018; Windows 11 24H2): `GameThread` at 90-100 % in 19 of 22 limit reports, steady gameplay ~99 displayed fps (DLSS Frame Generation was active, so the game itself ran at roughly half that), 173 of 218 samples CPU-bound. The first minute is shader compilation: all eight cores at 93-100 % and a 4-second hitch, which is normal.
+
+In all runs the CPU fix toggle made no clear difference, as expected for a thread limited by its own work.
+
+## The one thing the logs point at: other tools on the render thread
+
+In both newer recordings the swap-chain code the plugin found was not Windows' own: it lived in a module named
+`d3d11.dll` (Assassin's Creed IV) and `WINHTTP.dll` (Cyberpunk), i.e. another injected tool or wrapper under a
+proxy name, and Cyberpunk also loads RivaTuner's hook DLL. Such tools run inside every Present call on the thread
+that presents. When that thread is at 100 %, they are part of what it is busy with. Test, one change at a time,
+in the same scene: close RivaTuner/MSI Afterburner OSD, and temporarily rename the injector DLL (or disable the
+ReShade / OptiScaler-style add-on), then compare FPS and the *busiest thread* percentage. This is a test, not a
+promise: if the percentage and FPS do not change, that tool is not your cost.
 
 ## How to compare fairly
 
