@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <new>
 #include <string>
 #include <vector>
@@ -38,7 +39,9 @@ CpuTuner g_tuner;
 Overlay g_overlay;
 
 std::atomic<DWORD> g_renderTid{0};
+std::atomic<uint64_t> g_lastCountedQpc{0};  // when a measured Present last started
 std::atomic<const char*> g_api{nullptr};
+std::atomic<bool> g_syncOn{false};          // frame-latency control is switched on
 std::atomic<bool> g_frameGenLoaded{false};  // a frame-generation module is loaded: shown FPS may include generated frames
 volatile LONG g_initState = 0;
 uint64_t g_qpcFreq = 1;
@@ -116,6 +119,12 @@ std::vector<OverlayLine> BuildLines(bool statsOn, const std::wstring& toast) {
             if (o.cpuLoad && m.valid) lines.push_back({Fmt(L"CPU: %.0f%%  busiest thread: %.0f%%", m.processLoad * 100.0, m.hottestThreadLoad * 100.0), kWhite});
             if (o.busiestThread && m.valid && m.hottestThreadLoad >= 0.30 && !m.hottestLabel.empty())
                 lines.push_back({Fmt(L"  %ls  kernel %.0f%%", Widen(m.hottestLabel.c_str()).c_str(), m.hottestKernelShare * 100.0), kGrey});
+            if (o.cpuLoad && m.valid && (m.allowedCpus < m.systemCpus || m.restrictedThreads > 0 || m.widenedThreads > 0)) {
+                std::wstring t = Fmt(L"Cores allowed: %d/%d", m.allowedCpus, m.systemCpus);
+                if (m.restrictedThreads > 0) t += Fmt(L", %d thread(s) pinned to fewer", m.restrictedThreads);
+                if (m.widenedThreads > 0) t += Fmt(L", %d widened", m.widenedThreads);
+                lines.push_back({t, m.allowedCpus < m.systemCpus ? kYellow : kGrey});
+            }
             if (o.bottleneck) {
                 switch (ClassifyBottleneck(s, m.valid, m.hottestThreadLoad)) {
                     case Bound::Cpu: lines.push_back({L"Limit: CPU (one thread maxed)", kRed}); break;
@@ -125,6 +134,17 @@ std::vector<OverlayLine> BuildLines(bool statsOn, const std::wstring& toast) {
                 }
             }
             if (const char* api = g_api.load(std::memory_order_relaxed)) lines.push_back({Fmt(L"API: %ls", Widen(api).c_str()), kGrey});
+            if (o.syncInfo) {
+                const sources::SyncInfo si = sources::GetSyncInfo();
+                if (si.known) {
+                    const std::wstring vsync = si.presentInterval == 0 ? ((si.presentFlags & 0x200u) ? std::wstring(L"vsync off, tearing allowed") : std::wstring(L"vsync off"))
+                                                                       : Fmt(L"vsync %d", si.presentInterval);
+                    const std::wstring queue = si.frameLatency > 0 ? Fmt(L", queue %d", si.frameLatency) : std::wstring();
+                    lines.push_back({Fmt(L"Sync: %ls, %ls, %lu buffers%ls", vsync.c_str(), si.swapEffect >= 3 ? L"flip" : L"blit", static_cast<unsigned long>(si.bufferCount), queue.c_str()), kGrey});
+                }
+                const bool syncOn = g_syncOn.load(std::memory_order_relaxed);
+                lines.push_back({syncOn ? Fmt(L"Frame latency control: ON (max %d)", g_cfg.sync.maxFrameLatency) : std::wstring(L"Frame latency control: OFF"), syncOn ? kGreen : kGrey});
+            }
             if (g_frameGenLoaded.load(std::memory_order_relaxed)) lines.push_back({L"Frame generation loaded: FPS may include generated frames", kGrey});
         }
         if (o.cpuFixState) {
@@ -194,12 +214,19 @@ DWORD WINAPI WorkerMain(LPVOID) {
     bool overlayOn = g_cfg.overlay.showAtStart;
     bool keyOverlayDown = false, keyCpuDown = false;
     std::wstring toast;
-    uint64_t toastUntil = 0, nextPoll = 0, nextRefresh = 0, nextWindowSearch = 0, nextStatsLog = 5000, nextLimitLog = 0, nextHitchLog = 0, nextDiag = 0;
+    uint64_t toastUntil = 0, nextPoll = 0, nextRefresh = 0, nextWindowSearch = 0, nextStatsLog = 0, nextLimitLog = 0, nextHitchLog = 0, nextDiag = 0;
     uint32_t lastSeq = 0;
+    bool modulesLogged = false;
     int sustainedLimit = 0;
     DWORD seenRender = 0, stableRender = 0;
     uint64_t renderSince = 0, nextFgCheck = 0;
     HWND game = nullptr;
+    const uint64_t startMs = NowMs();  // NowMs() counts from system boot, so "20 s after start" must be relative to this
+    bool syncOn = g_cfg.sync.enabledAtStart;
+    bool keySyncDown = false;
+    sources::SetFrameLatency(syncOn ? g_cfg.sync.maxFrameLatency : 0);
+    g_syncOn.store(syncOn, std::memory_order_relaxed);
+    sources::SyncInfo lastSyncLogged;
 
     for (;;) {
         MsgWaitForMultipleObjects(0, nullptr, FALSE, 16, QS_ALLINPUT);
@@ -223,6 +250,16 @@ DWORD WINAPI WorkerMain(LPVOID) {
             nextRefresh = 0;
         }
 
+        if (HotkeyPressed(g_cfg.keySync, keySyncDown, focused)) {
+            syncOn = !syncOn;
+            sources::SetFrameLatency(syncOn ? g_cfg.sync.maxFrameLatency : 0);
+            g_syncOn.store(syncOn, std::memory_order_relaxed);
+            toast = syncOn ? Fmt(L"Frame latency control: ON (max %d queued)", g_cfg.sync.maxFrameLatency) : L"Frame latency control: OFF";
+            toastUntil = now + 2500;
+            nextRefresh = 0;
+            log::Write("frame latency control %s (max %d queued frames)", syncOn ? "ON" : "OFF", g_cfg.sync.maxFrameLatency);
+        }
+
         if (now >= nextPoll) {  // attach hooks for graphics APIs that appeared since the last look
             sources::Poll();
             nextPoll = now + 250;
@@ -230,7 +267,10 @@ DWORD WINAPI WorkerMain(LPVOID) {
 
         // Some engines (job systems such as Cyberpunk's redDispatcher, or frame generation) present from a different
         // thread every frame. Only a presenter that stayed the same for 5 s counts as "the render thread".
-        const DWORD curRender = g_renderTid.load(std::memory_order_relaxed);
+        // a presenter that stopped presenting (e.g. a loading screen thread) is not "the render thread" any more
+        const uint64_t lastCounted = g_lastCountedQpc.load(std::memory_order_relaxed);
+        const bool presenting = lastCounted != 0 && Qpc() - lastCounted < 2 * g_qpcFreq;
+        const DWORD curRender = presenting ? g_renderTid.load(std::memory_order_relaxed) : 0;
         if (curRender != seenRender) {
             seenRender = curRender;
             renderSince = now;
@@ -254,15 +294,40 @@ DWORD WINAPI WorkerMain(LPVOID) {
 
             if (now >= nextStatsLog) {  // one line every 5 s
                 nextStatsLog = now + 5000;
+                if (!fs.valid && now - startMs >= 20000 && !modulesLogged) {
+                    modulesLogged = true;
+                    LogLoadedModules();
+                }
+                const FrameCounters k = g_clock->Counters();
+                char why[420];
+                std::snprintf(why, sizeof(why), "present calls seen by hooks: %lu (outermost %lu); clock: offered %lu, ignored-other-surface %lu, surface switches %lu, gaps>5s %lu, clock-not-forward %lu, frames %lu",
+                              static_cast<unsigned long>(sources::g_rawPresentCalls.load()), static_cast<unsigned long>(sources::g_outerPresentCalls.load()),
+                              static_cast<unsigned long>(k.begins), static_cast<unsigned long>(k.ignoredSecondary), static_cast<unsigned long>(k.primarySwitches),
+                              static_cast<unsigned long>(k.longGaps), static_cast<unsigned long>(k.clockNotForward), static_cast<unsigned long>(k.entries));
+                if (m.valid) {  // is the game busy, or idle? (tells "not presenting" apart from "presenting but unseen")
+                    const size_t len = std::strlen(why);
+                    std::snprintf(why + len, sizeof(why) - len, "; process cpu %.0f%%, busiest thread %.0f%% %s", m.processLoad * 100.0, m.hottestThreadLoad * 100.0, m.hottestLabel.c_str());
+                }
                 if (!fs.valid) {
-                    log::Write("stats: no frames yet (hooked: %s)", sources::AttachedNames().c_str());
+                    log::Write("stats: no frames yet (hooked: %s) | %s", sources::AttachedNames().c_str(), why);
                 } else if (frozen) {
-                    log::Write("stats: no frames for %.0f s (paused, minimised or loading)", fs.msSinceLastFrame / 1000.0);
+                    log::Write("stats: no frames for %.0f s (paused, minimised or loading) | %s", fs.msSinceLastFrame / 1000.0, why);
                 } else {
                     const char* api = g_api.load(std::memory_order_relaxed);
                     log::Write("stats: %.1f fps, frame %.2f ms (max %.1f), 1%% low %.1f fps, present wait %.2f ms, cpu %.0f%%, busiest thread %.0f%%, tuned %d, api %s",
                                fs.fps, fs.frameMsAvg, fs.frameMsMax, fs.low1pctFps, fs.presentMsAvg, m.processLoad * 100.0, m.hottestThreadLoad * 100.0,
                                m.tunedThreads, api ? api : "?");
+                }
+            }
+
+            {
+                const sources::SyncInfo si = sources::GetSyncInfo();
+                if (si.known && (si.presentInterval != lastSyncLogged.presentInterval || si.bufferCount != lastSyncLogged.bufferCount || si.swapEffect != lastSyncLogged.swapEffect ||
+                                 si.frameLatency != lastSyncLogged.frameLatency || !lastSyncLogged.known)) {
+                    lastSyncLogged = si;
+                    log::Write("sync: present interval %d (0 = no vsync), flags 0x%lX, %lu buffers, swap effect %d (3-4 = flip), swap chain flags 0x%lX, frame latency %d (-1 = n/a)",
+                               si.presentInterval, static_cast<unsigned long>(si.presentFlags), static_cast<unsigned long>(si.bufferCount), si.swapEffect,
+                               static_cast<unsigned long>(si.swapChainFlags), si.frameLatency);
                 }
             }
 
@@ -272,8 +337,8 @@ DWORD WINAPI WorkerMain(LPVOID) {
                 sustainedLimit = (!frozen && m.hottestThreadLoad >= 0.90) ? sustainedLimit + 1 : 0;
                 if (sustainedLimit >= 3 && now >= nextLimitLog) {
                     nextLimitLog = now + 20000;
-                    log::Write("LIMIT: a thread has been at %.0f%% of a core for %d s while the whole process uses %.0f%% of the CPU | %s", m.hottestThreadLoad * 100.0,
-                               sustainedLimit, m.processLoad * 100.0, g_tuner.TopThreadsReport(4).c_str());
+                    log::Write("LIMIT: a thread has been at %.0f%% of a core for about %d s while the whole process uses %.0f%% of the CPU | %s", m.hottestThreadLoad * 100.0,
+                               sustainedLimit * g_cfg.cpu.sampleMs / 1000, m.processLoad * 100.0, g_tuner.TopThreadsReport(4).c_str());
                 }
             }
 
@@ -307,10 +372,15 @@ void Init() {
     const size_t slash = base.find_last_of(L"\\/");
     if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash)) base.resize(dot);
 
-    LoadConfig((base + L".ini").c_str(), g_cfg);
-    if (!g_cfg.enabled) return;
-    log::Init((base + L".log").c_str(), g_cfg.log);
+    const std::wstring ini = base + L".ini";
+    // The log must exist before the config is parsed, otherwise warnings about bad ini values are lost.
+    log::Init((base + L".log").c_str(), GetPrivateProfileIntW(L"General", L"Log", 0, ini.c_str()) != 0);
     log::Write("CpuBottleneckFix " CBF_VERSION " (%s) starting", sizeof(void*) == 8 ? "x64" : "x86");
+    LoadConfig(ini.c_str(), g_cfg);
+    if (!g_cfg.enabled) {
+        log::Write("disabled by Enabled=0 in the ini, doing nothing");
+        return;
+    }
     if (g_cfg.log) LogSystemInfo();
 
     LARGE_INTEGER f;
@@ -359,6 +429,10 @@ void StartInitThreadOnce() {
 
 // ---- called by the sources (declared in sources.h) ----
 
+namespace {
+uint64_t ticketBegin(const FrameClock::Ticket& t) { return t.begin; }
+}  // namespace
+
 FrameClock::Ticket OnPresentBegin(uintptr_t key, const char* api) {
     FrameClock::Ticket t;
     if (!g_clock) return t;
@@ -366,6 +440,7 @@ FrameClock::Ticket OnPresentBegin(uintptr_t key, const char* api) {
     t = g_clock->Begin(key, Qpc());
     if (t.counted) {
         g_renderTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        g_lastCountedQpc.store(ticketBegin(t), std::memory_order_relaxed);
         g_api.store(api, std::memory_order_relaxed);
     }
     return t;
