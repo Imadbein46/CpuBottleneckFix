@@ -25,21 +25,32 @@ FrameClock::FrameClock(uint64_t ticksPerSecond) : ticksPerSecond_(ticksPerSecond
 FrameClock::Ticket FrameClock::Begin(uintptr_t key, uint64_t now) {
     Ticket t;
     t.begin = now;
+    begins_.fetch_add(1, std::memory_order_relaxed);
 
     const uintptr_t primary = primary_.load(std::memory_order_relaxed);
     uint64_t last = lastBegin_.load(std::memory_order_relaxed);
 
     if (primary != key) {
         const bool primaryAlive = primary != 0 && last != 0 && now >= last && (now - last) < ticksPerSecond_;
-        if (primaryAlive) return t;  // a secondary surface: ignore it
+        if (primaryAlive) {  // a secondary surface: ignore it
+            ignored_.fetch_add(1, std::memory_order_relaxed);
+            return t;
+        }
+        switches_.fetch_add(1, std::memory_order_relaxed);
         primary_.store(key, std::memory_order_relaxed);
         last = 0;  // new surface: start a fresh interval
     }
 
     t.counted = true;
-    if (last != 0 && now > last && (now - last) <= ticksPerSecond_ * kMaxGapSeconds) {
-        const uint64_t us = (now - last) * 1000000ull / ticksPerSecond_;
-        t.intervalUs = us == 0 ? 1u : ClampU32(us);
+    if (last != 0) {
+        if (now <= last) {
+            notForward_.fetch_add(1, std::memory_order_relaxed);
+        } else if ((now - last) > ticksPerSecond_ * kMaxGapSeconds) {
+            longGaps_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const uint64_t us = (now - last) * 1000000ull / ticksPerSecond_;
+            t.intervalUs = us == 0 ? 1u : ClampU32(us);
+        }
     }
     lastBegin_.store(now, std::memory_order_relaxed);
     return t;
@@ -52,6 +63,17 @@ void FrameClock::End(const Ticket& t, uint64_t now) {
     const uint32_t i = static_cast<uint32_t>(slot & (kRing - 1));
     intervalUs_[i].store(t.intervalUs, std::memory_order_relaxed);
     presentUs_[i].store(ClampU32(presentUs), std::memory_order_relaxed);
+}
+
+FrameCounters FrameClock::Counters() const {
+    FrameCounters c;
+    c.begins = begins_.load(std::memory_order_relaxed);
+    c.ignoredSecondary = ignored_.load(std::memory_order_relaxed);
+    c.primarySwitches = switches_.load(std::memory_order_relaxed);
+    c.longGaps = longGaps_.load(std::memory_order_relaxed);
+    c.clockNotForward = notForward_.load(std::memory_order_relaxed);
+    c.entries = head_.load(std::memory_order_relaxed);
+    return c;
 }
 
 FrameStats FrameClock::Snapshot(uint64_t now) const {
