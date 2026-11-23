@@ -1,11 +1,15 @@
-# CpuBottleneckFix
+# CpuBottleneckFix.asi
 
 An ASI plugin for [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) that
 
 * **helps games that are limited by one busy CPU thread** (the "CPU fix", toggle with a hotkey), and
 * shows an **FPS / latency overlay** (toggle with a hotkey) that also tells you whether the CPU or the GPU is the limit.
 
-Works with Direct3D 8, 9, 10, 11, 12, OpenGL and Vulkan games. 32-bit and 64-bit builds included.
+Hooks exist for Direct3D 8, 9, 10, 11, 12, OpenGL and Vulkan. **What has actually been confirmed on real
+Windows 11 runs:** frame counting through DXGI (a Direct3D 11 game and a Direct3D 12 game). The Direct3D 9,
+OpenGL and Vulkan hooks install without errors but have not yet counted a frame in a real game, and Direct3D 8
+has not been run at all. One game (Onimusha: Way of the Sword) installed the hooks but counted no frames; the
+cause is not known. 32-bit and 64-bit builds included.
 
 ## Install
 
@@ -20,6 +24,7 @@ Hotkeys (work only while the game window has the focus; change them in the ini):
 |---|---|
 | `Ctrl+F9` | overlay on / off |
 | `Ctrl+F10` | CPU fix on / off (a short message confirms it, even when the overlay is hidden) |
+| `Ctrl+F11` | frame-latency control on / off (Direct3D 11 games, see *Syncing the CPU with the GPU*) |
 
 Uninstall: delete the `.asi` and `.ini`.
 
@@ -46,21 +51,57 @@ CPU fix: ON  (3 threads tuned)
 While it is ON the plugin, all of it reversible (toggle OFF restores the original values):
 
 1. asks Windows for a finer timer (0.5 ms) so sleeps and waits are accurate, which steadies frame pacing;
-2. opts the game out of power throttling (EcoQoS);
-3. raises the process priority class to *Above normal* (never lowers anything, never uses Realtime);
-4. gives the thread that calls Present and the process's main thread a slightly higher priority and their own
+2. opts the game out of power throttling (EcoQoS); switching the fix off puts back the state the process had before;
+3. lets the game use every logical CPU: if something restricted its CPU affinity (a launcher, a shortcut, a tool),
+   the restriction is lifted while the fix is on and put back when it is off (`UseAllCpus`); optionally it also
+   widens threads the game pinned to fewer CPUs (`WidenThreadAffinity`, off by default);
+4. raises the process priority class to *Above normal* (never lowers anything, never uses Realtime);
+5. gives the thread that calls Present and the process's main thread a slightly higher priority and their own
    physical core as *ideal processor* (a hint, not a hard pin). On CPUs with fast and slow cores it prefers the
    fast ones; it avoids core 0. Threads the game set to a non-default priority are left alone, and background
    worker threads are never given a priority boost;
-5. registers the presenting thread with the Windows multimedia scheduler ("Games" task).
+6. registers the presenting thread with the Windows multimedia scheduler ("Games" task).
+
+**Measured results (real runs, CPU fix switched on and off in the same scene):** Assassin's Creed IV
+85.4 fps on vs 84.3 fps off (+1.3 %, spread of +-7 to +-19 fps); Cyberpunk 2077 111.6 fps on vs 114.0 fps off
+(-2 %, spread +-2 fps). That is no measurable effect, so the CPU fix is **off by default** (`Enabled=0` in
+`[CpuFix]`; switch it on with `Ctrl+F10` and compare on your own system).
 
 **Honest expectations:** this improves *scheduling*. It cannot make a game's own code faster, so if a game is
 bound by its own single-threaded logic the gain is small. Gains are largest on systems with background load,
 power-saving settings or hybrid cores, and sometimes there is no visible change. Use the hotkey and the overlay
 to compare ON and OFF on your system.
 
-## What changed in 1.1 and 1.2 (driven by real-world logs)
+## What changed in 1.1 - 1.6 (driven by real-world logs)
 
+* **1.6.2** A manual + clang-tidy/Clang-Static-Analyzer bug hunt (see `BUGHUNT.md`) found and fixed a real bug:
+  with `WidenThreadAffinity=1`, a thread re-narrowed after being widened could have its saved original affinity
+  mask silently overwritten, so the CPU fix would restore the wrong mask on shutdown. Not triggered by default
+  (`WidenThreadAffinity` is off). Also fixed: clang-tidy's default invocation had been silently skipping 10 of
+  14 source files for lack of the right include paths; it now covers all of them.
+* **1.6.1** The log says whether each hooked swap-chain function is Windows' own code or provided by another
+  injected tool (`hooked ... (in X, Windows folder | game folder)` and a `note:` line). The first-call message no
+  longer calls a normal "another tool sits in front" situation DIFFERENT. The shipped CpuFix default is off.
+* **1.6** `UseAllCpus` (lift a restricted process affinity, restored when the fix is off), optional
+  `WidenThreadAffinity`, an overlay line and log line that show which threads are pinned, and the power plan's
+  CPU limits (min/max processor state, core parking, boost mode) in the system summary. The power-setting GUIDs
+  were checked against Microsoft's documentation and are unit-tested.
+* **1.5** A bug-first review of the whole source (method: oh-my-hermes `omh-code-review`) found and fixed:
+  the loaded-DLL list was written at the first stats line instead of after 20 s (absolute clock); switching the
+  CPU fix off reset power throttling to the system default instead of the original state; the `LIMIT:` line
+  counted samples as seconds; bad hotkeys in the ini were silently replaced because the log did not exist yet.
+  The thread-selection policy moved into a pure, unit-tested module. New: sync information on the overlay and in
+  the log, optional frame-latency control (`Ctrl+F11`), HAGS state in the system summary.
+* **1.4** Diagnostics for "hooks installed but no frames": the log records the first Present calls in detail,
+  re-checks every hook every 2 s (intact / restored to the original / another hook on top), shows whether the
+  game process is busy or idle in the no-frames line, and lists the loaded DLL names once after 20 s. The plugin
+  also watches the swap chains the game really creates (`CreateSwapChain*`) and hooks their Present code if it
+  differs from the throw-away device's. All hooked COM vtable slots are verified against the compiler's view of
+  the mingw-w64 headers (`tests/verify_vtable_slots.py`).
+* **1.3** When no frames are measured, the log line now says why: how many Present calls the hooks saw, how
+  many the frame clock ignored or rejected, and whether the clock moved forward. A presenter that stopped
+  presenting is no longer treated as the render thread. A frame-generation pacer thread
+  (`nv.sl.dlss_g...`) that presents frames is left alone instead of being tuned.
 * **1.2** The "render thread" is only tuned if the same thread has been presenting frames for 5 s. Engines with a
   job system (e.g. Cyberpunk 2077) and frame generation present from a different thread every frame; v1.1 kept
   re-tuning a random worker thread there.
@@ -93,23 +134,62 @@ See `CPU-BOTTLENECK-GUIDE.md` for how to read these lines and what to do about t
   the Ultimate ASI Loader `FrameLimiter` demo). If a game is *already* running in exclusive fullscreen when the
   plugin starts, that can occasionally disturb it; start the plugin with the game, as the loader normally does.
 
+## Using all CPU cores: what can and cannot be forced
+
+* **Can:** make sure the game is *allowed* to run on every logical CPU, and (opt-in) unpin threads the game pinned.
+* **Cannot:** make a game *use* more threads. How a game splits its work across threads is decided by its own code;
+  one thread's work cannot be divided from outside. If the game's main thread is the limit, the other cores
+  stay idle however many are allowed. In the recorded sessions the game was already allowed all 8 CPUs (the one
+  exception was restricted to 7), and while CPU-bound it already used 2.3-5.0 cores' worth of work with one
+  thread at about 100 %.
+* **Also visible:** with `Log=1` the log lists the power plan's CPU limits (minimum / maximum processor state,
+  core parking, boost mode) and warns when the plan caps or parks the CPU; see the guide for how to change them.
+
+## Syncing the CPU with the GPU
+
+The numbers from real sessions (three recordings, 432 samples) show the GPU waiting for the CPU in most
+samples (66-94 %), and the CPU waiting for the GPU or vsync in only 1-14 %. In that situation nothing about
+synchronisation can raise the frame rate, because the GPU is the one that has nothing to do. What the plugin can
+do is make the synchronisation **visible** and, for Direct3D 11 games, **tighter**:
+
+* The overlay and the log show what Present asks for (vsync interval, tearing allowed), the swap chain model
+  (flip or blit, number of buffers) and, for Direct3D 11, how many frames the CPU may queue ahead.
+* `[Sync]` / `Ctrl+F11` caps that queue (default 1 frame). Effect: lower input latency and less CPU run-ahead.
+  Cost: with a GPU-bound game it can lose a few percent of FPS. It is off by default and the game's own value
+  is restored when it is switched off. It does nothing for Direct3D 12 (those games manage their own queue).
+* With `Log=1` the system summary lists whether hardware GPU scheduling (HAGS) is on; that Windows setting
+  decides whether the CPU or the GPU schedules GPU work, and is worth testing both ways.
+
 ## Testing status (please read)
 
-Verified: compiles without warnings for x86 and x64 (GCC 13 mingw-w64, `-Wall -Wextra -Wshadow -Wformat=2`);
-`cppcheck` clean; 173 unit checks for the frame-timing, hotkey and classifier logic pass under AddressSanitizer,
-UndefinedBehaviorSanitizer and ThreadSanitizer; binaries import only Windows system DLLs and export exactly
-`InitializeASI`.
+Verified on the build machine: compiles without warnings for x86 and x64 (GCC 13 mingw-w64,
+`-Wall -Wextra -Wshadow -Wformat=2`); `cppcheck` clean; every hooked COM vtable slot checked against the
+headers (`tests/verify_vtable_slots.py`); 212 unit checks (frame timing, hotkeys, classifier, thread-selection
+policy, affinity rules, power-setting GUIDs) pass under AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer; binaries import only
+Windows system DLLs and export exactly `InitializeASI`.
 
-**Not verified:** a run on real Windows with a real game. The build environment had no Windows and Wine could
-not start there. The hook code follows the loader's own `FrameLimiter` demo, but the first run on your machine is
-the real test. If anything misbehaves, set `Log=1` and send `CpuBottleneckFix.log`.
-`tests/wine/harness.cpp` is a small fake game (loads the `.asi`, presents frames through OpenGL or D3D9) you can
-build and run to check a system quickly.
+Verified on real hardware (Windows 11 24H2, Intel Core i7-9700K, several logged sessions): the
+plugin loads, installs hooks, counts frames through DXGI, toggles the CPU fix and the overlay, and restores
+settings. **Not verified:** frame counting through Direct3D 8/9, OpenGL and Vulkan; the frame-latency control
+(1.5), the affinity widening and the power-plan reading (1.6): none has run on real hardware yet; the plugin under anti-tamper layers or other injectors.
+`tests/wine/harness.cpp` is a small fake game you can build and run to check a system quickly.
+
+## Other tools in the render path
+
+Overlays and wrappers (ReShade, RivaTuner/RTSS, Special K, OptiScaler-style injectors, Steam/Discord overlays, a
+`d3d11.dll` or `dxgi.dll` dropped into the game folder, ...) hook the same Present calls. With `Log=1` the
+`hooked ... (in <module>, <where>)` lines show whether the code the plugin hooked belongs to Windows or to such a
+tool, and a `note:` line names it. Everything that hooks Present runs on the game's render thread, which is
+exactly the thread that limits many CPU-bound games, so each extra hook costs a little frame time there.
 
 ## Troubleshooting
 
 * Overlay says *Waiting for frames... No graphics API detected*: the game uses an API that is not hooked (see
   limits) or hasn't created its device yet.
+* Overlay says *Waiting for frames... Hooked: DXGI* (or another API) and never shows numbers: the hooks are
+  installed but no frame was measured. Set `Log=1`; the `stats: no frames yet ... |` line lists the counters
+  that show where it stops. Something in the process that changes how the game runs or reports hardware
+  (anti-tamper layers, other injectors, hypervisor tools) can prevent hooks from working.
 * No overlay in fullscreen: switch the game to borderless / windowed.
 * Hotkeys do nothing: another program may own that combination; change it in the ini. They only work while the
   game window has the focus.
