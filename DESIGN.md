@@ -10,9 +10,11 @@ codebase to review, so the skill was applied while designing rather than as a re
 | `ParseHotkey` | one function | key-name table, modifier handling, validation | native unit tests |
 | `ClassifyBottleneck` | one pure function | heuristic thresholds | native unit tests |
 | `CpuTuner` | `Init`, `SetEnabled`, `Tick`, `GetMetrics` | CPU topology, hybrid-core ranking, per-thread load sampling, hysteresis, reversible changes | `CpuTuner` logs every action (`Log=1`) |
+| `ChooseTargets` | one pure function | critical-thread selection, worker hysteresis, de-duplication, deterministic ordering | native unit tests |
 | `Overlay` | `Create`, `Update`, `Destroy` | layered click-through window, DPI, positioning, focus rules | visual |
 | `sources` (**seam**) | `Init`, `Poll`, `PresentScope`, `Adapter` | MinHook, TLS nesting guard, last-error preservation, retry policy | log output |
 | adapters `D3D8/D3D9/DXGI/OpenGL/Vulkan` | one `Adapter` struct each | dummy-device vtable discovery, per-API quirks | log output |
+| sync control (`source_dxgi.cpp`) | `SetFrameLatency`, `GetSyncInfo` | swap-chain description capture, device frame-latency override and exact restore | log output |
 | `plugin.cpp` | `InitializeASI`, `DllMain` | init-once, worker thread, hotkeys, overlay text | - |
 
 **Seam / adapters.** "A frame was presented" is the seam. Five adapters sit behind it (a seam with one adapter is
