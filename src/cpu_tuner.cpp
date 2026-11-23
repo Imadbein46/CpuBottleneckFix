@@ -7,6 +7,7 @@
 #include <cstdio>
 
 #include "log.h"
+#include "tuner_policy.h"
 
 namespace cbf {
 namespace {
@@ -53,8 +54,6 @@ constexpr ULONG kThrottleIgnoreTimerResolution = 0x4;
 // calls the byte after Flags "EfficiencyClass". Both layouts put GroupCount at offset 22.
 static_assert(offsetof(PROCESSOR_RELATIONSHIP, GroupCount) == 22, "unexpected PROCESSOR_RELATIONSHIP layout");
 
-constexpr double kWorkerEnterLoad = 0.60;  // an extra worker thread must use >= 60% of a core to be picked...
-constexpr double kWorkerStayLoad = 0.30;   // ...and keeps its place while it stays above 30%
 constexpr int kMissedSamplesBeforeRestore = 3;
 constexpr uint64_t kIdleTickMs = 5000;        // how often the critical threads are re-checked when nothing is displayed
 constexpr uint64_t kIdleFullScanMs = 60000;   // and how often all threads are scanned (also frees handles of dead threads)
@@ -79,6 +78,8 @@ void CpuTuner::Init(const CpuFixConfig& cfg) {
     api_.NtSetTimerResolution = Resolve<decltype(api_.NtSetTimerResolution)>(nt, "NtSetTimerResolution");
     api_.NtQueryTimerResolution = Resolve<decltype(api_.NtQueryTimerResolution)>(nt, "NtQueryTimerResolution");
     api_.SetProcessInformation = Resolve<decltype(api_.SetProcessInformation)>(k32, "SetProcessInformation");
+    api_.GetProcessInformation = Resolve<decltype(api_.GetProcessInformation)>(k32, "GetProcessInformation");
+    api_.GetThreadGroupAffinity = Resolve<decltype(api_.GetThreadGroupAffinity)>(k32, "GetThreadGroupAffinity");
     api_.GetLogicalProcessorInformationEx = Resolve<decltype(api_.GetLogicalProcessorInformationEx)>(k32, "GetLogicalProcessorInformationEx");
     api_.SetThreadIdealProcessorEx = Resolve<decltype(api_.SetThreadIdealProcessorEx)>(k32, "SetThreadIdealProcessorEx");
     api_.GetThreadIdealProcessorEx = Resolve<decltype(api_.GetThreadIdealProcessorEx)>(k32, "GetThreadIdealProcessorEx");
@@ -89,7 +90,15 @@ void CpuTuner::Init(const CpuFixConfig& cfg) {
     LARGE_INTEGER f;
     qpcFreq_ = (QueryPerformanceFrequency(&f) && f.QuadPart > 0) ? static_cast<uint64_t>(f.QuadPart) : 1;
 
-    // denominator for the process-wide CPU load: logical CPUs this process may run on
+    RefreshAffinityState();
+    initialised_ = true;
+    log::Write("CpuTuner ready: %u CPUs for this process, %u usable physical cores for placement", cpuCountForLoad_,
+               static_cast<unsigned>(cores_.size()));
+}
+
+// Called at start and whenever we change the process affinity: the CPU count behind the load figure and the list of
+// cores usable for placement both depend on which CPUs the process may run on.
+void CpuTuner::RefreshAffinityState() {
     unsigned count = 0;
     DWORD_PTR procMask = 0, sysMask = 0;
     if (GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask)) {
@@ -101,11 +110,7 @@ void CpuTuner::Init(const CpuFixConfig& cfg) {
         count = si.dwNumberOfProcessors;
     }
     cpuCountForLoad_ = std::max(1u, count);
-
     BuildTopology();
-    initialised_ = true;
-    log::Write("CpuTuner ready: %u CPUs for this process, %u usable physical cores for placement", cpuCountForLoad_,
-               static_cast<unsigned>(cores_.size()));
 }
 
 void CpuTuner::BuildTopology() {
@@ -122,11 +127,14 @@ void CpuTuner::BuildTopology() {
         USHORT groups[16];
         USHORT count = 16;
         if (!api_.GetProcessGroupAffinity(GetCurrentProcess(), &count, groups) || count != 1) {
-            log::Write("topology: process spans several processor groups, core placement disabled");
+            log::Write("topology: process spans several processor groups, core placement and affinity changes disabled");
+            singleGroup_ = false;
             return;
         }
         procGroup = groups[0];
     }
+    singleGroup_ = true;
+    procGroup_ = procGroup;
 
     DWORD_PTR procMask = 0, sysMask = 0;
     if (!GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask) || procMask == 0) return;
@@ -219,6 +227,16 @@ void CpuTuner::ApplyProcessSettings() {
 
     // 2) power throttling (EcoQoS) off + do not ignore our timer request when the window is not in focus
     if (cfg_.disablePowerThrottling && api_.SetProcessInformation) {
+        // remember what the game (or the system) had set, so that switching the fix off puts exactly that back
+        haveOrigThrottle_ = false;
+        if (api_.GetProcessInformation) {
+            PowerThrottlingState orig = {kThrottleCurrentVersion, 0, 0};
+            if (api_.GetProcessInformation(GetCurrentProcess(), kProcessPowerThrottling, &orig, sizeof(orig))) {
+                haveOrigThrottle_ = true;
+                origThrottleControl_ = orig.ControlMask;
+                origThrottleState_ = orig.StateMask;
+            }
+        }
         PowerThrottlingState st = {kThrottleCurrentVersion, kThrottleExecutionSpeed | kThrottleIgnoreTimerResolution, 0};
         if (api_.SetProcessInformation(GetCurrentProcess(), kProcessPowerThrottling, &st, sizeof(st))) {
             throttlingChanged_ = true;
@@ -232,7 +250,24 @@ void CpuTuner::ApplyProcessSettings() {
         }
     }
 
-    // 3) priority class: only ever raised
+    // 3) let the process use every logical CPU. A launcher, a shortcut or a tool may have restricted it (for
+    //    example to 7 of 8 CPUs). Only ever widens, and only when the current mask is a subset of the system's.
+    if (cfg_.useAllCpus && singleGroup_) {
+        DWORD_PTR pm = 0, sm = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && ShouldWidenAffinity(pm, sm)) {
+            if (SetProcessAffinityMask(GetCurrentProcess(), sm)) {
+                affinityChanged_ = true;
+                origProcessAffinity_ = pm;
+                ourProcessAffinity_ = sm;
+                RefreshAffinityState();
+                log::Write("process affinity widened from %d to %d logical CPUs", CountCpus(pm), CountCpus(sm));
+            } else {
+                log::Write("process affinity could not be widened (error %lu)", static_cast<unsigned long>(GetLastError()));
+            }
+        }
+    }
+
+    // 4) priority class: only ever raised
     if (cfg_.processPriority != ProcessPriority::Unchanged) {
         DWORD target = NORMAL_PRIORITY_CLASS;
         switch (cfg_.processPriority) {
@@ -257,9 +292,16 @@ void CpuTuner::RestoreProcessSettings() {
         timerRequested_ = false;
     }
     if (throttlingChanged_ && api_.SetProcessInformation) {
-        PowerThrottlingState st = {kThrottleCurrentVersion, 0, 0};  // 0/0 = let the system decide again
+        // exactly what was there before; if it could not be read, 0/0 = let the system decide again
+        PowerThrottlingState st = {kThrottleCurrentVersion, haveOrigThrottle_ ? origThrottleControl_ : 0, haveOrigThrottle_ ? origThrottleState_ : 0};
         api_.SetProcessInformation(GetCurrentProcess(), kProcessPowerThrottling, &st, sizeof(st));
         throttlingChanged_ = false;
+    }
+    if (affinityChanged_) {
+        DWORD_PTR pm = 0, sm = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm == ourProcessAffinity_) SetProcessAffinityMask(GetCurrentProcess(), origProcessAffinity_);
+        affinityChanged_ = false;
+        RefreshAffinityState();
     }
     if (priorityChanged_) {
         if (GetPriorityClass(GetCurrentProcess()) == ourPriorityClass_) SetPriorityClass(GetCurrentProcess(), origPriorityClass_);
@@ -345,7 +387,16 @@ std::string CpuTuner::TopThreadsReport(size_t count) {
 }
 
 void CpuTuner::TuneThread(DWORD tid, ThreadState& s, bool critical) {
-    if (!s.handle) return;
+    if (!s.handle || s.ignore) return;
+    if (critical && tid != mainTid_) {
+        // With frame generation the thread that calls Present is the pacer, not the game's render thread.
+        const std::string label = BuildLabel(tid, s);
+        if (label.find("dlss_g") != std::string::npos || label.find("framegen") != std::string::npos || label.find("frame_gen") != std::string::npos) {
+            s.ignore = true;
+            log::Write("left thread %lu alone (frame-generation pacer): %s", static_cast<unsigned long>(tid), label.c_str());
+            return;
+        }
+    }
     s.tuned = true;
     s.critical = critical;
     s.missed = 0;
@@ -388,7 +439,17 @@ void CpuTuner::TuneThread(DWORD tid, ThreadState& s, bool critical) {
                s.prioChanged ? "raised" : "unchanged", s.idealChanged ? "set" : "unchanged");
 }
 
+void CpuTuner::RestoreAffinity(ThreadState& s) {
+    if (!s.affinityWidened) return;
+    if (s.handle && api_.GetThreadGroupAffinity) {
+        GROUP_AFFINITY ga{};
+        if (api_.GetThreadGroupAffinity(s.handle, &ga) && ga.Mask == s.ourAffinity) SetThreadAffinityMask(s.handle, s.origAffinity);
+    }
+    s.affinityWidened = false;
+}
+
 void CpuTuner::RestoreThread(ThreadState& s) {
+    RestoreAffinity(s);
     if (s.handle) {
         if (s.prioChanged && GetThreadPriority(s.handle) == s.ourPriority) SetThreadPriority(s.handle, s.origPriority);
         if (s.idealChanged && api_.GetThreadIdealProcessorEx && api_.SetThreadIdealProcessorEx) {
@@ -411,6 +472,7 @@ void CpuTuner::RestoreThread(ThreadState& s) {
 void CpuTuner::RestoreAllThreads() {
     for (auto& kv : threads_) {
         if (kv.second.tuned) RestoreThread(kv.second);
+        else RestoreAffinity(kv.second);  // widened but never tuned
     }
     metrics_.tunedThreads = 0;
 }
@@ -455,7 +517,7 @@ void CpuTuner::TuneCriticalOnly(DWORD renderTid, DWORD selfTid) {
         }
         ThreadState& st = it->second;
         st.missed = 0;
-        if (st.tuned && st.critical) return;
+        if (st.ignore || (st.tuned && st.critical)) return;
         if (st.tuned) RestoreThread(st);
         TuneThread(tid, st, true);
     };
@@ -505,6 +567,12 @@ void CpuTuner::Sample(uint64_t now, DWORD renderTid, DWORD selfTid) {
         }
     }
 
+    // the mask every thread of the process is allowed to use right now
+    DWORD_PTR procMaskNow = 0, sysMaskNow = 0;
+    GetProcessAffinityMask(GetCurrentProcess(), &procMaskNow, &sysMaskNow);
+    int restricted = 0, widened = 0;
+    std::string restrictedExamples;
+
     // measure each thread
     double hottest = 0;
     DWORD hottestTid = 0;
@@ -538,6 +606,50 @@ void CpuTuner::Sample(uint64_t now, DWORD renderTid, DWORD selfTid) {
             hottest = st.load;
             hottestTid = tid;
         }
+
+        // is this thread pinned to fewer CPUs than the process may use?
+        if (singleGroup_ && api_.GetThreadGroupAffinity && tid != selfTid && procMaskNow != 0) {
+            GROUP_AFFINITY ga{};
+            if (api_.GetThreadGroupAffinity(st.handle, &ga) && ga.Group == procGroup_) {
+                st.affinityMask = ga.Mask;
+                if (st.affinityWidened && ga.Mask == st.ourAffinity) {
+                    ++widened;
+                } else if (ShouldWidenAffinity(ga.Mask, procMaskNow)) {
+                    ++restricted;
+                    if (cfg_.widenThreadAffinity && enabled_.load(std::memory_order_relaxed)) {
+                        const DWORD_PTR prev = SetThreadAffinityMask(st.handle, procMaskNow);
+                        if (prev != 0) {
+                            // Only remember the FIRST original mask. If the thread is seen here again (the game, or
+                            // anything else, re-narrowed it to another subset while we were still widening it), `prev`
+                            // is our own intermediate value, not the thread's true original, and must not overwrite it.
+                            if (!st.affinityWidened) st.origAffinity = prev;
+                            st.affinityWidened = true;
+                            st.ourAffinity = procMaskNow;
+                            --restricted;
+                            ++widened;
+                            log::Write("widened thread %lu affinity from %d to %d CPUs: %s", static_cast<unsigned long>(tid), CountCpus(prev), CountCpus(procMaskNow),
+                                       BuildLabel(tid, st).c_str());
+                        }
+                    } else if (restrictedExamples.size() < 220) {
+                        char buf[48];
+                        std::snprintf(buf, sizeof(buf), "tid %lu pinned to %d CPU(s): ", static_cast<unsigned long>(tid), CountCpus(ga.Mask));
+                        restrictedExamples += buf + BuildLabel(tid, st) + "; ";
+                    }
+                }
+            }
+        }
+    }
+
+    // report pinned threads when the picture changes (at most every 30 s)
+    if (restricted != lastRestrictedLogged_ && now >= nextRestrictedLogQpc_) {
+        lastRestrictedLogged_ = restricted;
+        nextRestrictedLogQpc_ = now + 30 * qpcFreq_;
+        if (restricted > 0) {
+            log::Write("affinity: the process may use %d of %d logical CPUs, %d thread(s) are pinned to fewer | %s", CountCpus(procMaskNow), CountCpus(sysMaskNow), restricted,
+                       restrictedExamples.c_str());
+        } else {
+            log::Write("affinity: the process may use %d of %d logical CPUs, no thread is pinned to fewer", CountCpus(procMaskNow), CountCpus(sysMaskNow));
+        }
     }
 
     // The main thread is the oldest one still alive (the process's initial thread).
@@ -559,6 +671,10 @@ void CpuTuner::Sample(uint64_t now, DWORD renderTid, DWORD selfTid) {
         const double procDelta = procCpu >= lastProcCpu100ns_ ? static_cast<double>(procCpu - lastProcCpu100ns_) : 0.0;
         metrics_.processLoad = std::min(1.0, procDelta / (wall100ns * static_cast<double>(cpuCountForLoad_)));
         metrics_.hottestThreadLoad = hottest;
+        metrics_.allowedCpus = CountCpus(procMaskNow);
+        metrics_.systemCpus = CountCpus(sysMaskNow);
+        metrics_.restrictedThreads = restricted;
+        metrics_.widenedThreads = widened;
         metrics_.hottestTid = hottestTid;
         metrics_.hottestKernelShare = 0;
         metrics_.hottestLabel.clear();
@@ -590,38 +706,20 @@ void CpuTuner::Sample(uint64_t now, DWORD renderTid, DWORD selfTid) {
     }
 
     // Who gets tuned: the thread that presents and the main thread (priority + own core), plus optionally the
-    // busiest background workers (own core only, never a priority change).
-    struct Want {
-        DWORD tid;
-        bool critical;
-    };
-    std::vector<Want> desired;
+    // busiest background workers (own core only, never a priority change). The decision itself lives in
+    // tuner_policy.cpp, where it is unit-tested.
+    std::vector<ThreadView> views;
+    views.reserve(threads_.size());
+    for (const auto& kv : threads_) views.push_back({kv.first, kv.second.load, kv.second.tuned});
+    const std::vector<Target> desired = ChooseTargets(views, renderTid, mainTid, selfTid, cfg_.workerThreads);
     auto isDesired = [&desired](DWORD tid) {
-        return std::any_of(desired.begin(), desired.end(), [tid](const Want& w) { return w.tid == tid; });
+        return std::any_of(desired.begin(), desired.end(), [tid](const Target& w) { return w.tid == tid; });
     };
-    auto addCritical = [&](DWORD tid) {
-        if (tid != 0 && tid != selfTid && threads_.count(tid) && !isDesired(tid)) desired.push_back({tid, true});
-    };
-    addCritical(renderTid);
-    addCritical(mainTid);
 
-    if (cfg_.workerThreads > 0) {
-        std::vector<std::pair<double, DWORD>> ranked;
-        for (const auto& kv : threads_) {
-            if (kv.first == selfTid || isDesired(kv.first)) continue;
-            if (kv.second.load >= (kv.second.tuned ? kWorkerStayLoad : kWorkerEnterLoad)) ranked.emplace_back(kv.second.load, kv.first);
-        }
-        std::sort(ranked.begin(), ranked.end(), [](const std::pair<double, DWORD>& a, const std::pair<double, DWORD>& b) { return a.first > b.first; });
-        for (const auto& r : ranked) {
-            if (static_cast<int>(desired.size()) >= 2 + cfg_.workerThreads) break;  // render + main + extras
-            desired.push_back({r.second, false});
-        }
-    }
-
-    for (const Want& w : desired) {
+    for (const Target& w : desired) {
         ThreadState& st = threads_[w.tid];
         if (st.tuned && st.critical != w.critical) RestoreThread(st);
-        if (!st.tuned) TuneThread(w.tid, st, w.critical);
+        if (!st.tuned && !st.ignore) TuneThread(w.tid, st, w.critical);
         st.missed = 0;
     }
     for (auto& kv : threads_) {
