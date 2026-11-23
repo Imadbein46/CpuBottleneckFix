@@ -1,4 +1,4 @@
-# CpuBottleneckFix.asi
+# CpuBottleneckFix
 
 An ASI plugin for [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) that
 
